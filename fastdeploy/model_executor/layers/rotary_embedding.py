@@ -132,6 +132,96 @@ class QwenRotaryEmbedding:
         return rot_emb
 
 
+class MiniCPMLongRoPE:
+    """
+    MiniCPM LongRoPE implementation for extended context length.
+
+    This implements the LongRoPE position encoding used in MiniCPM4 models,
+    which supports context lengths up to 65536 tokens.
+
+    The implementation uses short_factor and long_factor to adjust the
+    position frequencies based on whether the sequence length exceeds
+    the original_max_position_embeddings.
+
+    Args:
+        rotary_dim: Dimension of rotary embeddings (head dimension)
+        base: Base value for computing inverse frequencies (default: 10000)
+        max_position_embeddings: Maximum position embedding length
+        short_factor: Frequency scaling factors for short sequences
+        long_factor: Frequency scaling factors for long sequences
+        original_max_position_embeddings: Original context length threshold
+    """
+
+    def __init__(
+        self,
+        rotary_dim: int,
+        base: float = 10000.0,
+        max_position_embeddings: int = 65536,
+        short_factor: list = None,
+        long_factor: list = None,
+        original_max_position_embeddings: int = 65536,
+    ):
+        self.rotary_dim = rotary_dim
+        self.base = base
+        self.max_position_embeddings = max_position_embeddings
+        self.short_factor = short_factor
+        self.long_factor = long_factor
+        self.original_max_position_embeddings = original_max_position_embeddings
+
+        # Compute scaling factor based on the extension ratio
+        scale = max_position_embeddings / original_max_position_embeddings
+        self.scaling_factor = math.sqrt(
+            1 + math.log(scale) / math.log(original_max_position_embeddings)
+        ) if scale > 1 else 1.0
+
+        # Precompute base inverse frequencies
+        self.inv_freq = 1.0 / (
+            self.base ** (paddle.arange(0, self.rotary_dim, 2, dtype="float32") / self.rotary_dim)
+        )
+
+    def __call__(self, position_ids):
+        """
+        Compute rotary position embeddings.
+
+        Args:
+            position_ids: Tensor of shape [batch_size, seq_len] containing position indices
+
+        Returns:
+            rot_emb: Tensor of shape [2, batch_size, seq_len, 1, rotary_dim] containing
+                     cos and sin embeddings
+        """
+        bsz, max_seq_len = position_ids.shape[:2]
+
+        # Determine which scaling factors to use based on sequence length
+        if max_seq_len > self.original_max_position_embeddings:
+            ext_factors = paddle.to_tensor(self.long_factor, dtype="float32")
+        else:
+            ext_factors = paddle.to_tensor(self.short_factor, dtype="float32")
+
+        # Compute scaled inverse frequencies
+        t = position_ids.cast("float32")  # [B, S]
+
+        # Apply LongRoPE frequency scaling
+        # freqs = t @ (inv_freq / ext_factors)
+        scaled_inv_freq = self.inv_freq / ext_factors
+        freqs = paddle.einsum("ij,k->ijk", t, scaled_inv_freq)  # [B, S, D/2]
+
+        # Apply magnitude scaling
+        cos_freqs = paddle.cos(freqs) * self.scaling_factor
+        sin_freqs = paddle.sin(freqs) * self.scaling_factor
+
+        # Construct rotary embedding in neox style [cos, cos] and [sin, sin]
+        emb_cos = paddle.concat([cos_freqs, cos_freqs], axis=-1)  # [B, S, D]
+        emb_sin = paddle.concat([sin_freqs, sin_freqs], axis=-1)  # [B, S, D]
+
+        # Reshape to [2, B, S, 1, D]
+        rot_emb = paddle.zeros((2, bsz, max_seq_len, 1, self.rotary_dim), dtype="float32")
+        rot_emb[0] = emb_cos.unsqueeze(2)  # [B, S, 1, D]
+        rot_emb[1] = emb_sin.unsqueeze(2)  # [B, S, 1, D]
+
+        return rot_emb
+
+
 def yarn_get_mscale(scale=1, mscale=1):
     """ """
     if scale <= 1:
@@ -350,6 +440,24 @@ def get_rope_impl(
             beta_slow=model_config.rope_scaling["beta_slow"],
             use_neox_rotary_style=True,
         )
+        rotary_emb = rotary_emb_layer(position_ids)
+    elif architecture.startswith("MiniCPM"):
+        # MiniCPM uses LongRoPE for extended context length
+        rope_scaling = getattr(model_config, "rope_scaling", None)
+        if rope_scaling and rope_scaling.get("rope_type") == "longrope":
+            rotary_emb_layer = MiniCPMLongRoPE(
+                rotary_dim=rotary_dim,
+                base=base,
+                max_position_embeddings=getattr(model_config, "max_position_embeddings", 65536),
+                short_factor=rope_scaling.get("short_factor"),
+                long_factor=rope_scaling.get("long_factor"),
+                original_max_position_embeddings=rope_scaling.get(
+                    "original_max_position_embeddings", 65536
+                ),
+            )
+        else:
+            # Fallback to standard Qwen-style RoPE for MiniCPM without LongRoPE
+            rotary_emb_layer = QwenRotaryEmbedding(rotary_dim, base, partial_rotary_factor)
         rotary_emb = rotary_emb_layer(position_ids)
     else:
         rotary_emb_layer = ErnieRotaryEmbedding(rotary_dim, base, partial_rotary_factor)
